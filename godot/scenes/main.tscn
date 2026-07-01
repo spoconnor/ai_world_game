@@ -1,0 +1,20 @@
+[gd_scene load_steps=3 format=3 uid="uid://world_landscape_viewer_main"]
+
+[ext_resource type="Script" path="res://scripts/world_viewer.gd" id="1_world"]
+[ext_resource type="Script" path="res://scripts/orbit_camera.gd" id="2_camera"]
+
+[node name="Main" type="Node3D"]
+script = ExtResource("1_world")
+
+[node name="Sun" type="DirectionalLight3D" parent="."]
+transform = Transform3D(0.707107, -0.353553, 0.612372, 0, 0.866025, 0.5, -0.707107, -0.353553, 0.612372, 0, 500, 0)
+light_energy = 2.2
+shadow_enabled = true
+
+[node name="CameraRig" type="Node3D" parent="."]
+script = ExtResource("2_camera")
+
+[node name="Camera3D" type="Camera3D" parent="CameraRig"]
+current = true
+fov = 55.0
+far = 200000.0
