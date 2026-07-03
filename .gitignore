@@ -1,0 +1,7 @@
+world_data/
+terrain_tool/obj/
+terrain_tool/.vs/
+terrain_tool/bin/
+godot/.godot/shader_cache/
+godot/.godot/imported/
+godot/.godot/editor/

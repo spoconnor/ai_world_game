@@ -7,6 +7,8 @@ extends Node3D
 const BIOME_COLORS := {
 	"ocean": Color(0.09, 0.24, 0.42),
 	"coast": Color(0.70, 0.66, 0.48),
+	"river": Color(0.08, 0.34, 0.58),
+	"lake": Color(0.06, 0.29, 0.50),
 	"grassland": Color(0.43, 0.62, 0.28),
 	"woodland": Color(0.26, 0.48, 0.25),
 	"temperate_rainforest": Color(0.13, 0.38, 0.25),
@@ -52,15 +54,15 @@ func _load_manifest(path: String) -> Dictionary:
 	return parsed
 
 func _build_world(manifest: Dictionary) -> void:
-	var scale := manifest.get("scale", {})
-	var height := manifest.get("height", {})
-	var chunk_grid := manifest.get("chunk_grid", {})
+	var scale_info: Dictionary = manifest.get("scale", {})
+	var height: Dictionary = manifest.get("height", {})
+	var chunk_grid: Dictionary = manifest.get("chunk_grid", {})
 	var chunks: Array = manifest.get("chunks", [])
 
-	var meters_per_unit := float(scale.get("meters_per_godot_unit", 10.0))
-	var chunk_size_meters := float(scale.get("chunk_size_meters", 10000.0))
-	var world_width_meters := float(scale.get("world_width_meters", 0.0))
-	var world_height_meters := float(scale.get("world_height_meters", 0.0))
+	var meters_per_unit := float(scale_info.get("meters_per_godot_unit", 10.0))
+	var chunk_size_meters := float(scale_info.get("chunk_size_meters", 10000.0))
+	var world_width_meters := float(scale_info.get("world_width_meters", 0.0))
+	var world_height_meters := float(scale_info.get("world_height_meters", 0.0))
 	var min_height := float(height.get("min_height", -250.0))
 	var max_height := float(height.get("max_height", 3600.0))
 	var samples_x := int(chunk_grid.get("samples_x", 129))
@@ -97,9 +99,9 @@ func _build_world(manifest: Dictionary) -> void:
 
 	var camera_rig := get_node_or_null("CameraRig")
 	if camera_rig != null and camera_rig.has_method("focus_on"):
-		var max_height_units := max(abs(min_height), abs(max_height)) / meters_per_unit * vertical_exaggeration
+		var max_height_units: float = max(abs(min_height), abs(max_height)) / meters_per_unit * vertical_exaggeration
 		var center := Vector3(0.0, max_height_units * 0.2, 0.0)
-		var radius := max(world_width_units, world_height_units) * 0.58
+		var radius: float = max(world_width_units, world_height_units) * 0.58
 		camera_rig.focus_on(center, radius)
 
 func _build_chunk_mesh(
@@ -126,13 +128,18 @@ func _build_chunk_mesh(
 		push_warning("Skipping %s: expected %d bytes, found %d." % [height_path, expected_bytes, bytes.size()])
 		return null
 
+	var dominant_biome := String(chunk.get("dominant_biome", "grassland"))
+	var biome_bytes := _load_biome_bytes(chunk, manifest_directory, samples_x * samples_y)
+
 	var chunk_x := int(chunk.get("x", 0))
 	var chunk_y := int(chunk.get("y", 0))
 	var step_x := chunk_size_units / float(samples_x - 1)
 	var step_y := chunk_size_units / float(samples_y - 1)
 	var vertices := PackedVector3Array()
+	var colors := PackedColorArray()
 	var indices := PackedInt32Array()
 	vertices.resize(samples_x * samples_y)
+	colors.resize(samples_x * samples_y)
 
 	for local_y in range(samples_y):
 		for local_x in range(samples_x):
@@ -146,6 +153,7 @@ func _build_chunk_mesh(
 				chunk_y * chunk_size_units + local_y * step_y
 			)
 			vertices[sample_index] = vertex
+			colors[sample_index] = _get_biome_sample_color(biome_bytes, sample_index, dominant_biome)
 
 	for local_y in range(samples_y - 1):
 		for local_x in range(samples_x - 1):
@@ -153,11 +161,12 @@ func _build_chunk_mesh(
 			var b := a + 1
 			var c := a + samples_x
 			var d := c + 1
-			indices.append_array([a, c, b, b, c, d])
+			indices.append_array([a, b, c, b, d, c])
 
 	var arrays := []
 	arrays.resize(Mesh.ARRAY_MAX)
 	arrays[Mesh.ARRAY_VERTEX] = vertices
+	arrays[Mesh.ARRAY_COLOR] = colors
 	arrays[Mesh.ARRAY_INDEX] = indices
 
 	var mesh := ArrayMesh.new()
@@ -171,8 +180,64 @@ func _build_chunk_mesh(
 	var mesh_instance := MeshInstance3D.new()
 	mesh_instance.name = "Chunk_%03d_%03d" % [chunk_x, chunk_y]
 	mesh_instance.mesh = mesh
-	mesh_instance.material_override = _make_biome_material(String(chunk.get("dominant_biome", "grassland")))
+	mesh_instance.material_override = _make_terrain_material()
 	return mesh_instance
+
+func _load_biome_bytes(chunk: Dictionary, manifest_directory: String, expected_bytes: int) -> PackedByteArray:
+	var biome_file := String(chunk.get("biome_file", ""))
+	if biome_file.is_empty():
+		return PackedByteArray()
+
+	var biome_path := manifest_directory.path_join(biome_file)
+	var file := FileAccess.open(biome_path, FileAccess.READ)
+	if file == null:
+		push_warning("Missing chunk biome file: %s" % biome_path)
+		return PackedByteArray()
+
+	var bytes := file.get_buffer(file.get_length())
+	if bytes.size() != expected_bytes:
+		push_warning("Ignoring %s: expected %d bytes, found %d." % [biome_path, expected_bytes, bytes.size()])
+		return PackedByteArray()
+
+	return bytes
+
+func _get_biome_sample_color(biome_bytes: PackedByteArray, sample_index: int, fallback_biome: String) -> Color:
+	if biome_bytes.is_empty():
+		return BIOME_COLORS.get(fallback_biome, Color(0.45, 0.55, 0.36))
+
+	var biome_id := _biome_id_from_index(biome_bytes[sample_index])
+	return BIOME_COLORS.get(biome_id, Color(0.45, 0.55, 0.36))
+
+func _biome_id_from_index(index: int) -> String:
+	match index:
+		0:
+			return "ocean"
+		1:
+			return "coast"
+		2:
+			return "river"
+		3:
+			return "lake"
+		4:
+			return "grassland"
+		5:
+			return "woodland"
+		6:
+			return "temperate_rainforest"
+		7:
+			return "mountain_forest"
+		8:
+			return "dry_mountains"
+		9:
+			return "highland_forest"
+		10:
+			return "cold_steppe"
+		11:
+			return "alpine"
+		12:
+			return "arid_scrub"
+		_:
+			return "grassland"
 
 func _build_water_plane(width: float, height: float, water_y: float, world_offset: Vector3) -> void:
 	var plane := PlaneMesh.new()
@@ -191,10 +256,10 @@ func _build_water_plane(width: float, height: float, water_y: float, world_offse
 	_water.position = world_offset + Vector3(width * 0.5, water_y, height * 0.5)
 	add_child(_water)
 
-func _make_biome_material(biome: String) -> StandardMaterial3D:
+func _make_terrain_material() -> StandardMaterial3D:
 	var material := StandardMaterial3D.new()
-	var color: Color = BIOME_COLORS.get(biome, Color(0.45, 0.55, 0.36))
-	material.albedo_color = color
+	material.vertex_color_use_as_albedo = true
+	material.albedo_color = Color.WHITE
 	material.roughness = 0.9
 	return material
 

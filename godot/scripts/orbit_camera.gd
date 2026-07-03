@@ -65,13 +65,13 @@ func _handle_mouse_motion(event: InputEventMouseMotion) -> void:
 		)
 		_update_camera()
 	elif _right_down or _middle_down or (_left_down and _right_down):
-		var basis := _camera.global_transform.basis
-		var right := basis.x
-		var forward := -basis.z
+		var camera_basis: Basis = _camera.global_transform.basis
+		var right: Vector3 = camera_basis.x
+		var forward: Vector3 = -camera_basis.z
 		forward.y = 0.0
 		forward = forward.normalized()
-		var scale := max(distance * pan_speed, 0.2)
-		target += (-right * event.relative.x + forward * event.relative.y) * scale
+		var pan_amount: float = max(distance * pan_speed, 0.2)
+		target += (-right * event.relative.x + forward * event.relative.y) * pan_amount
 		_update_camera()
 
 func _zoom(direction: float) -> void:
