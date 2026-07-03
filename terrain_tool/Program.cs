@@ -30,7 +30,8 @@ internal sealed record ToolOptions(
     int ChunksX,
     int ChunksY,
     int SamplesPerChunk,
-    int Seed)
+    int Seed,
+    int ErosionIterations)
 {
     public static ToolOptions Parse(string[] args)
     {
@@ -39,6 +40,7 @@ internal sealed record ToolOptions(
         var chunksY = DefaultChunksY;
         var samples = DefaultSamplesPerChunk;
         var seed = 12345;
+        var erosionIterations = DefaultErosionIterations;
 
         for (var i = 0; i < args.Length; i++)
         {
@@ -71,6 +73,9 @@ internal sealed record ToolOptions(
                 case "--seed":
                     seed = int.Parse(NextValue(), CultureInfo.InvariantCulture);
                     break;
+                case "--erosion-iterations":
+                    erosionIterations = ParseNonNegativeInt(arg, NextValue());
+                    break;
                 case "--help":
                 case "-h":
                     PrintHelp();
@@ -86,7 +91,7 @@ internal sealed record ToolOptions(
             throw new ArgumentException("--samples must be at least 2");
         }
 
-        return new ToolOptions(output, chunksX, chunksY, samples, seed);
+        return new ToolOptions(output, chunksX, chunksY, samples, seed, erosionIterations);
     }
 
     private static int ParsePositiveInt(string name, string value)
@@ -100,6 +105,17 @@ internal sealed record ToolOptions(
         return parsed;
     }
 
+    private static int ParseNonNegativeInt(string name, string value)
+    {
+        var parsed = int.Parse(value, CultureInfo.InvariantCulture);
+        if (parsed < 0)
+        {
+            throw new ArgumentException($"{name} must be non-negative");
+        }
+
+        return parsed;
+    }
+
     private static void PrintHelp()
     {
         Console.WriteLine("WorldTerrainTool");
@@ -108,6 +124,8 @@ internal sealed record ToolOptions(
         Console.WriteLine("  --chunks-y <count>    Chunk rows. Default: 5");
         Console.WriteLine("  --samples <count>     Height samples per chunk edge. Default: 257");
         Console.WriteLine("  --seed <number>       Deterministic generation seed. Default: 12345");
+        Console.WriteLine("  --erosion-iterations <count>");
+        Console.WriteLine("                        Hydraulic erosion iterations. Default: 96");
     }
 }
 
@@ -119,8 +137,6 @@ internal sealed class IslandWorldGenerator
     private readonly List<HarborSite> _harborSites;
     private readonly List<IslandSeed> _smallIslands;
     private readonly List<MountainPeak> _randomMountains;
-    private readonly List<LakeBasin> _lakes;
-    private readonly List<RiverPath> _rivers;
 
     public IslandWorldGenerator(ToolOptions options)
     {
@@ -130,8 +146,6 @@ internal sealed class IslandWorldGenerator
         _smallIslands = BuildSmallIslands(options.Seed);
         _harborSites = BuildHarborSites(options.Seed);
         _randomMountains = BuildRandomMountains(options.Seed);
-        _lakes = new List<LakeBasin>();
-        _rivers = BuildRiverPaths(options.Seed);
     }
 
     public WorldManifest Generate()
@@ -144,6 +158,7 @@ internal sealed class IslandWorldGenerator
 
         Directory.CreateDirectory(chunksDirectory);
 
+        var terrainMap = BuildTerrainMap();
         var chunkMetadata = new List<ChunkMetadata>(_options.ChunksX * _options.ChunksY);
         var biomeCounts = new Dictionary<string, int>(StringComparer.Ordinal);
 
@@ -151,12 +166,14 @@ internal sealed class IslandWorldGenerator
         {
             for (var chunkX = 0; chunkX < _options.ChunksX; chunkX++)
             {
-                var dominantBiome = GenerateChunk(chunkX, chunkY, chunksDirectory, biomeCounts);
+                var dominantBiome = GenerateChunk(chunkX, chunkY, chunksDirectory, terrainMap, biomeCounts);
                 chunkMetadata.Add(new ChunkMetadata(
                     chunkX,
                     chunkY,
                     $"chunks/chunk_x{chunkX:000}_y{chunkY:000}.height",
                     $"chunks/chunk_x{chunkX:000}_y{chunkY:000}.biome",
+                    $"chunks/chunk_x{chunkX:000}_y{chunkY:000}.flow",
+                    $"chunks/chunk_x{chunkX:000}_y{chunkY:000}.soil",
                     dominantBiome));
             }
         }
@@ -166,6 +183,7 @@ internal sealed class IslandWorldGenerator
             new GeneratorInfo("WorldTerrainTool", _options.Seed, "island_archipelago_v1"),
             new ScaleInfo(MetersPerGodotUnit, ChunkSizeMeters, _worldWidthMeters, _worldHeightMeters),
             new HeightInfo(MinHeightMeters, MaxHeightMeters, "uint16_little_endian", "height = min_height + sample / 65535.0 * (max_height - min_height)"),
+            new ErosionInfo(_options.ErosionIterations, "float32_little_endian", "flow_accumulation stores normalized accumulated water flow per sample; soil_depth stores loose/deposited soil depth in meters per sample."),
             new BiomeInfo("uint8_palette_index", "One biome palette index per height sample, row-major order.", BuildBiomePalette()),
             new ChunkGridInfo(_options.ChunksX, _options.ChunksY, _options.SamplesPerChunk, _options.SamplesPerChunk),
             chunkMetadata,
@@ -175,30 +193,39 @@ internal sealed class IslandWorldGenerator
             BuildBiomeRegions(biomeCounts));
     }
 
-    private string GenerateChunk(int chunkX, int chunkY, string chunksDirectory, Dictionary<string, int> biomeCounts)
+    private string GenerateChunk(int chunkX, int chunkY, string chunksDirectory, TerrainMap terrainMap, Dictionary<string, int> biomeCounts)
     {
         var samples = _options.SamplesPerChunk;
         var biomeVotes = new Dictionary<string, int>(StringComparer.Ordinal);
         var heightPath = Path.Combine(chunksDirectory, $"chunk_x{chunkX:000}_y{chunkY:000}.height");
         var biomePath = Path.Combine(chunksDirectory, $"chunk_x{chunkX:000}_y{chunkY:000}.biome");
+        var flowPath = Path.Combine(chunksDirectory, $"chunk_x{chunkX:000}_y{chunkY:000}.flow");
+        var soilPath = Path.Combine(chunksDirectory, $"chunk_x{chunkX:000}_y{chunkY:000}.soil");
 
         using var heightStream = File.Create(heightPath);
         using var heightWriter = new BinaryWriter(heightStream);
         using var biomeStream = File.Create(biomePath);
         using var biomeWriter = new BinaryWriter(biomeStream);
+        using var flowStream = File.Create(flowPath);
+        using var flowWriter = new BinaryWriter(flowStream);
+        using var soilStream = File.Create(soilPath);
+        using var soilWriter = new BinaryWriter(soilStream);
 
         for (var localY = 0; localY < samples; localY++)
         {
             for (var localX = 0; localX < samples; localX++)
             {
-                var worldX = (chunkX + localX / (double)(samples - 1)) * ChunkSizeMeters;
-                var worldY = (chunkY + localY / (double)(samples - 1)) * ChunkSizeMeters;
-                var terrain = EvaluateTerrain(worldX, worldY);
-                heightWriter.Write(ToSample(terrain.HeightMeters));
-                biomeWriter.Write(GetBiomeIndex(terrain.Biome));
+                var sampleX = chunkX * (samples - 1) + localX;
+                var sampleY = chunkY * (samples - 1) + localY;
+                var height = terrainMap.HeightMeters[sampleY, sampleX];
+                var biome = ClassifyBiomeForCell(terrainMap, sampleX, sampleY);
+                heightWriter.Write(ToSample(height));
+                biomeWriter.Write(GetBiomeIndex(biome));
+                flowWriter.Write((float)terrainMap.FlowAccumulation[sampleY, sampleX]);
+                soilWriter.Write((float)terrainMap.SoilDepthMeters[sampleY, sampleX]);
 
-                biomeVotes[terrain.Biome] = biomeVotes.GetValueOrDefault(terrain.Biome) + 1;
-                biomeCounts[terrain.Biome] = biomeCounts.GetValueOrDefault(terrain.Biome) + 1;
+                biomeVotes[biome] = biomeVotes.GetValueOrDefault(biome) + 1;
+                biomeCounts[biome] = biomeCounts.GetValueOrDefault(biome) + 1;
             }
         }
 
@@ -220,7 +247,51 @@ internal sealed class IslandWorldGenerator
             .ToList();
     }
 
-    private TerrainSample EvaluateTerrain(double worldX, double worldY)
+    private TerrainMap BuildTerrainMap()
+    {
+        var samples = _options.SamplesPerChunk;
+        var width = _options.ChunksX * (samples - 1) + 1;
+        var height = _options.ChunksY * (samples - 1) + 1;
+        var sampleCount = (long)width * height;
+        if (sampleCount > MaxGlobalErosionSamples)
+        {
+            throw new InvalidOperationException($"Global erosion supports up to {MaxGlobalErosionSamples:N0} samples for this prototype; requested {sampleCount:N0}. Use fewer chunks/samples or implement tiled erosion with padding for larger worlds.");
+        }
+
+        var map = new TerrainMap(width, height, ChunkSizeMeters / (samples - 1));
+
+        for (var y = 0; y < height; y++)
+        {
+            var worldY = y / (double)(height - 1) * _worldHeightMeters;
+            for (var x = 0; x < width; x++)
+            {
+                var worldX = x / (double)(width - 1) * _worldWidthMeters;
+                var sample = EvaluateBaseTerrain(worldX, worldY);
+                map.HeightMeters[y, x] = sample.HeightMeters;
+                map.BaseMoisture[y, x] = sample.Moisture;
+                map.Temperature[y, x] = sample.Temperature;
+                map.MountainMask[y, x] = sample.MountainMask;
+                map.LandMask[y, x] = sample.LandMask;
+                map.SoilDepthMeters[y, x] = sample.HeightMeters > 0.0
+                    ? Lerp(0.45, 4.8, SmoothStep(0.08, 0.55, sample.LandMask))
+                    : 0.0;
+            }
+        }
+
+        ErosionSimulator.Run(map, _options.Seed, _options.ErosionIterations);
+        return map;
+    }
+
+    private string ClassifyBiomeForCell(TerrainMap map, int x, int y)
+    {
+        var height = map.HeightMeters[y, x];
+        var flowWetness = SmoothStep(0.03, 0.72, map.FlowAccumulation[y, x]);
+        var soilWetness = SmoothStep(0.6, 7.0, map.SoilDepthMeters[y, x]);
+        var moisture = Clamp01(map.BaseMoisture[y, x] + flowWetness * 0.22 + soilWetness * 0.10);
+        return ClassifyBiome(height, moisture, map.Temperature[y, x], map.MountainMask[y, x]);
+    }
+
+    private BaseTerrainSample EvaluateBaseTerrain(double worldX, double worldY)
     {
         var nx = worldX / _worldWidthMeters * 2.0 - 1.0;
         var ny = worldY / _worldHeightMeters * 2.0 - 1.0;
@@ -299,54 +370,13 @@ internal sealed class IslandWorldGenerator
             }
         }
 
-        var riverStrength = 0.0;
-        foreach (var river in _rivers)
-        {
-            var riverSample = SampleRiver(river, worldX, worldY);
-            var channel = SmoothStep(river.WidthMeters, 0.0, riverSample.DistanceMeters);
-            var valley = SmoothStep(river.WidthMeters * 5.5, 0.0, riverSample.DistanceMeters);
-            if (valley <= 0.0)
-            {
-                continue;
-            }
-
-            var bedHeight = Lerp(river.SourceHeightMeters, -8.0, Math.Pow(riverSample.T, 0.72));
-            height -= valley * (24.0 + 120.0 * (1.0 - riverSample.T));
-            if (height > bedHeight)
-            {
-                height = Lerp(height, bedHeight, channel * 0.86);
-            }
-
-            riverStrength = Math.Max(riverStrength, channel);
-        }
-
-        var lakeStrength = 0.0;
-        foreach (var lake in _lakes)
-        {
-            var lakeDistance = Distance(worldX, worldY, lake.XMeters, lake.YMeters);
-            var lakeCore = SmoothStep(lake.RadiusMeters, lake.RadiusMeters * 0.72, lakeDistance);
-            var lakeShore = SmoothStep(lake.RadiusMeters * 1.35, lake.RadiusMeters * 0.9, lakeDistance);
-            if (lakeShore <= 0.0)
-            {
-                continue;
-            }
-
-            if (height > lake.WaterHeightMeters)
-            {
-                height = Lerp(height, lake.WaterHeightMeters, lakeCore * 0.94);
-            }
-
-            height -= lakeShore * 12.0;
-            lakeStrength = Math.Max(lakeStrength, lakeCore);
-        }
-
         height = Lerp(-220.0, height, land);
         var mountainRainShadow = Math.Max(rangeMask, Math.Max(secondaryRangeMask * 0.75, randomPeakMask * 0.45));
-        var moisture = Clamp01(0.55 + Noise.Fractal(nx * 4.0 - 2.0, ny * 4.0 + 5.0, _options.Seed + 503, 4, 0.5) * 0.32 - mountainRainShadow * Math.Max(0.0, nx) * 0.35 + riverStrength * 0.22 + lakeStrength * 0.28);
+        var moisture = Clamp01(0.55 + Noise.Fractal(nx * 4.0 - 2.0, ny * 4.0 + 5.0, _options.Seed + 503, 4, 0.5) * 0.32 - mountainRainShadow * Math.Max(0.0, nx) * 0.35);
         var temperature = Clamp01(0.72 - Math.Abs(ny) * 0.25 - Math.Max(0.0, height) / 4_500.0);
         var combinedMountainMask = Math.Max(rangeMask, Math.Max(secondaryRangeMask, randomPeakMask));
 
-        return new TerrainSample(Clamp(height, MinHeightMeters, MaxHeightMeters), ClassifyBiome(height, moisture, temperature, combinedMountainMask, riverStrength, lakeStrength));
+        return new BaseTerrainSample(Clamp(height, MinHeightMeters, MaxHeightMeters), moisture, temperature, combinedMountainMask, land);
     }
 
     private List<HarborMetadata> BuildHarbors()
@@ -362,26 +392,12 @@ internal sealed class IslandWorldGenerator
 
     private List<RiverMetadata> BuildRivers()
     {
-        return _rivers.Select((river, index) => new RiverMetadata(
-            $"river_{index + 1:00}",
-            river.Name,
-            Math.Round(river.WidthMeters, 2),
-            river.Points
-                .Select(point => new RiverPointMetadata(
-                    Math.Round((point.X + 1.0) * 0.5 * _worldWidthMeters, 2),
-                    Math.Round((point.Y + 1.0) * 0.5 * _worldHeightMeters, 2)))
-                .ToList())).ToList();
+        return new List<RiverMetadata>();
     }
 
     private List<LakeMetadata> BuildLakes()
     {
-        return _lakes.Select((lake, index) => new LakeMetadata(
-            $"lake_{index + 1:00}",
-            lake.Name,
-            Math.Round(lake.XMeters, 2),
-            Math.Round(lake.YMeters, 2),
-            Math.Round(lake.RadiusMeters, 2),
-            Math.Round(lake.WaterHeightMeters, 2))).ToList();
+        return new List<LakeMetadata>();
     }
 
     private static List<BiomeRegion> BuildBiomeRegions(Dictionary<string, int> biomeCounts)
@@ -441,296 +457,6 @@ internal sealed class IslandWorldGenerator
         return peaks;
     }
 
-    private List<RiverPath> BuildRiverPaths(int seed)
-    {
-        var random = new Random(seed + 15091);
-        var names = new[] { "Ashrun", "Brightwater", "Stonewash", "Lowmere", "Redbranch", "Hollowrun" };
-        var rivers = new List<RiverPath>();
-        var sources = new List<NormalizedPoint>();
-
-        for (var i = 0; i < names.Length; i++)
-        {
-            var source = PickRiverSource(random, sources);
-            sources.Add(source);
-            var sourceHeight = BaseTerrainHeight(source.X, source.Y);
-            var points = TraceRiverDownhill(source, random);
-
-            rivers.Add(new RiverPath(
-                names[i],
-                115.0 + random.NextDouble() * 95.0,
-                Math.Max(420.0, sourceHeight - 80.0),
-                points));
-        }
-
-        return rivers;
-    }
-
-    private NormalizedPoint PickRiverSource(Random random, List<NormalizedPoint> existingSources)
-    {
-        var best = new NormalizedPoint(0.0, 0.0);
-        var bestScore = double.MinValue;
-
-        for (var i = 0; i < 160; i++)
-        {
-            var angle = random.NextDouble() * Math.PI * 2.0;
-            var radius = Math.Sqrt(random.NextDouble()) * 0.58;
-            var candidate = new NormalizedPoint(
-                Math.Cos(angle) * radius,
-                Math.Sin(angle) * radius * 0.82);
-
-            var height = BaseTerrainHeight(candidate.X, candidate.Y);
-            if (height < 520.0)
-            {
-                continue;
-            }
-
-            var spacingPenalty = existingSources
-                .Select(source => Math.Max(0.0, 0.28 - Distance(candidate.X, candidate.Y, source.X, source.Y)) * 1_800.0)
-                .DefaultIfEmpty(0.0)
-                .Sum();
-            var score = height - spacingPenalty + random.NextDouble() * 120.0;
-            if (score > bestScore)
-            {
-                best = candidate;
-                bestScore = score;
-            }
-        }
-
-        return bestScore == double.MinValue
-            ? new NormalizedPoint((random.NextDouble() - 0.5) * 0.55, (random.NextDouble() - 0.5) * 0.45)
-            : best;
-    }
-
-    private List<NormalizedPoint> TraceRiverDownhill(NormalizedPoint source, Random random)
-    {
-        const int maxSteps = 220;
-        const double step = 0.020;
-
-        var points = new List<NormalizedPoint> { source };
-        var current = source;
-        var previousDirection = Normalize(current.X, current.Y);
-        var lakeCount = 0;
-
-        for (var i = 0; i < maxSteps; i++)
-        {
-            var currentHeight = BaseTerrainHeight(current.X, current.Y);
-            if (currentHeight <= 12.0 || Math.Abs(current.X) > 0.94 || Math.Abs(current.Y) > 0.90)
-            {
-                break;
-            }
-
-            var best = current;
-            var bestScore = double.MaxValue;
-            var bestHeight = currentHeight;
-
-            for (var directionIndex = 0; directionIndex < 16; directionIndex++)
-            {
-                var angle = directionIndex / 16.0 * Math.PI * 2.0;
-                var direction = new NormalizedVector(Math.Cos(angle), Math.Sin(angle));
-                var candidate = new NormalizedPoint(
-                    Clamp(current.X + direction.X * step, -0.98, 0.98),
-                    Clamp(current.Y + direction.Y * step, -0.94, 0.94));
-                var candidateHeight = BaseTerrainHeight(candidate.X, candidate.Y);
-                var downhill = currentHeight - candidateHeight;
-                var outward = Math.Sqrt(candidate.X * candidate.X + candidate.Y * candidate.Y);
-                var turnPenalty = 1.0 - (direction.X * previousDirection.X + direction.Y * previousDirection.Y);
-                var meander = Noise.Fractal(candidate.X * 24.0, candidate.Y * 24.0, _options.Seed + 17003 + i, 2, 0.5);
-
-                var score = candidateHeight
-                    - Math.Max(0.0, downhill) * 0.55
-                    - outward * 80.0
-                    + Math.Max(0.0, -downhill - 24.0) * 18.0
-                    + turnPenalty * 38.0
-                    + meander * 16.0
-                    + random.NextDouble() * 4.0;
-
-                if (score < bestScore)
-                {
-                    best = candidate;
-                    bestHeight = candidateHeight;
-                    bestScore = score;
-                }
-            }
-
-            if (Distance(current.X, current.Y, best.X, best.Y) <= 0.0001)
-            {
-                break;
-            }
-
-            if (lakeCount < 3 && currentHeight > 65.0 && bestHeight > currentHeight - 2.5)
-            {
-                var lake = BuildLakeAt(current, currentHeight, previousDirection, random);
-                _lakes.Add(lake.Basin);
-                lakeCount++;
-                points.Add(lake.Center);
-                points.Add(lake.Outlet);
-                previousDirection = Normalize(lake.Outlet.X - current.X, lake.Outlet.Y - current.Y);
-                current = lake.Outlet;
-                continue;
-            }
-
-            previousDirection = Normalize(best.X - current.X, best.Y - current.Y);
-            current = best;
-
-            if (i % 3 == 0 || BaseTerrainHeight(current.X, current.Y) <= 18.0)
-            {
-                points.Add(current);
-            }
-        }
-
-        if (points[^1] != current)
-        {
-            points.Add(current);
-        }
-
-        return SimplifyRiverPoints(points);
-    }
-
-    private RiverLakeCrossing BuildLakeAt(NormalizedPoint center, double basinHeight, NormalizedVector flowDirection, Random random)
-    {
-        var radiusNormalized = 0.026 + random.NextDouble() * 0.024;
-        var radiusMeters = radiusNormalized * Math.Min(_worldWidthMeters, _worldHeightMeters) * 0.5;
-        var waterHeight = Math.Max(18.0, basinHeight + 4.0 + random.NextDouble() * 8.0);
-        var outlet = center;
-        var outletScore = double.MaxValue;
-
-        for (var directionIndex = 0; directionIndex < 48; directionIndex++)
-        {
-            var angle = directionIndex / 48.0 * Math.PI * 2.0;
-            var direction = new NormalizedVector(Math.Cos(angle), Math.Sin(angle));
-            var candidate = new NormalizedPoint(
-                Clamp(center.X + direction.X * radiusNormalized * 1.28, -0.98, 0.98),
-                Clamp(center.Y + direction.Y * radiusNormalized * 1.28, -0.94, 0.94));
-            var candidateHeight = BaseTerrainHeight(candidate.X, candidate.Y);
-            var sameSideBonus = direction.X * flowDirection.X + direction.Y * flowDirection.Y;
-            var outward = Math.Sqrt(candidate.X * candidate.X + candidate.Y * candidate.Y);
-            var score = candidateHeight - sameSideBonus * 90.0 - outward * 35.0 + random.NextDouble() * 4.0;
-
-            if (score < outletScore)
-            {
-                outlet = candidate;
-                outletScore = score;
-            }
-        }
-
-        var worldX = (center.X + 1.0) * 0.5 * _worldWidthMeters;
-        var worldY = (center.Y + 1.0) * 0.5 * _worldHeightMeters;
-        var basin = new LakeBasin(
-            $"Lake {_lakes.Count + 1:00}",
-            worldX,
-            worldY,
-            radiusMeters,
-            waterHeight);
-
-        return new RiverLakeCrossing(center, outlet, basin);
-    }
-
-    private static List<NormalizedPoint> SimplifyRiverPoints(List<NormalizedPoint> points)
-    {
-        if (points.Count <= 2)
-        {
-            return points;
-        }
-
-        var simplified = new List<NormalizedPoint> { points[0] };
-        for (var i = 1; i < points.Count - 1; i++)
-        {
-            var previous = simplified[^1];
-            var current = points[i];
-            var next = points[i + 1];
-            var ab = Normalize(current.X - previous.X, current.Y - previous.Y);
-            var bc = Normalize(next.X - current.X, next.Y - current.Y);
-            var dot = ab.X * bc.X + ab.Y * bc.Y;
-
-            if (Distance(previous.X, previous.Y, current.X, current.Y) > 0.055 || dot < 0.985)
-            {
-                simplified.Add(current);
-            }
-        }
-
-        simplified.Add(points[^1]);
-        return simplified;
-    }
-
-    private double BaseTerrainHeight(double nx, double ny)
-    {
-        var aspect = _worldWidthMeters / _worldHeightMeters;
-        var islandX = nx / Math.Max(0.75, aspect);
-        var islandY = ny * Math.Max(0.75, aspect);
-
-        var warpX = Noise.Fractal(nx * 1.8 + 11.0, ny * 1.8 - 7.0, _options.Seed, 4, 0.5);
-        var warpY = Noise.Fractal(nx * 1.8 - 19.0, ny * 1.8 + 23.0, _options.Seed + 37, 4, 0.5);
-        var distance = Math.Sqrt(Math.Pow(islandX + warpX * 0.18, 2) + Math.Pow(islandY + warpY * 0.12, 2));
-        var mainIsland = SmoothStep(0.98, 0.48, distance);
-
-        var smallIslandMask = 0.0;
-        foreach (var island in _smallIslands)
-        {
-            var dx = nx - island.X;
-            var dy = ny - island.Y;
-            var d = Math.Sqrt(dx * dx + dy * dy);
-            smallIslandMask = Math.Max(smallIslandMask, SmoothStep(island.Radius, island.Radius * 0.42, d));
-        }
-
-        var land = Clamp01(Math.Max(mainIsland, smallIslandMask));
-        var coastNoise = Noise.Fractal(nx * 8.0, ny * 8.0, _options.Seed + 101, 5, 0.52);
-        land = Clamp01(land + coastNoise * 0.08);
-
-        var mountainCenterY = 0.08 * Math.Sin(nx * Math.PI * 1.5) - 0.08 * nx;
-        var mountainDistance = Math.Abs(ny - mountainCenterY);
-        var rangeMask = SmoothStep(0.30, 0.025, mountainDistance) * SmoothStep(0.08, 0.28, mainIsland);
-        var ridgeNoise = Noise.Fractal(nx * 10.0, ny * 10.0, _options.Seed + 211, 5, 0.55);
-        var ridge = Math.Pow(rangeMask, 1.8) * (0.75 + ridgeNoise * 0.35);
-
-        var secondaryCenterY = -0.48 * nx + 0.22 + 0.07 * Math.Sin((nx + 0.25) * Math.PI * 2.2);
-        var secondaryDistance = Math.Abs(ny - secondaryCenterY) / Math.Sqrt(1.0 + 0.48 * 0.48);
-        var secondaryRangeMask = SmoothStep(0.24, 0.018, secondaryDistance) * SmoothStep(0.12, 0.34, mainIsland);
-        var secondaryRidgeNoise = Noise.Fractal(nx * 12.0 + 3.0, ny * 12.0 - 5.0, _options.Seed + 233, 5, 0.56);
-        var secondaryRidge = Math.Pow(secondaryRangeMask, 1.65) * (0.70 + secondaryRidgeNoise * 0.32);
-
-        var randomPeakHeight = 0.0;
-        foreach (var peak in _randomMountains)
-        {
-            var peakDistance = Distance(nx, ny, peak.X, peak.Y);
-            var peakMask = SmoothStep(peak.Radius, peak.Radius * 0.18, peakDistance) * SmoothStep(0.10, 0.30, mainIsland);
-            if (peakMask <= 0.0)
-            {
-                continue;
-            }
-
-            var peakNoise = Noise.Fractal(nx * peak.Ruggedness, ny * peak.Ruggedness, _options.Seed + peak.NoiseOffset, 4, 0.52);
-            randomPeakHeight += Math.Pow(peakMask, 1.55) * peak.HeightMeters * (0.84 + peakNoise * 0.24);
-        }
-
-        var lowlandNoise = Noise.Fractal(nx * 5.0, ny * 5.0, _options.Seed + 301, 5, 0.5);
-        var detailNoise = Noise.Fractal(nx * 18.0, ny * 18.0, _options.Seed + 401, 4, 0.45);
-        var coastalShelf = SmoothStep(0.08, 0.35, land);
-        var height = -180.0
-            + land * 320.0
-            + coastalShelf * lowlandNoise * 260.0
-            + coastalShelf * detailNoise * 90.0
-            + ridge * 2_850.0
-            + secondaryRidge * 1_950.0
-            + randomPeakHeight;
-
-        var worldX = (nx + 1.0) * 0.5 * _worldWidthMeters;
-        var worldY = (ny + 1.0) * 0.5 * _worldHeightMeters;
-        foreach (var harbor in _harborSites)
-        {
-            var bayDistance = Distance(worldX, worldY, harbor.XMeters, harbor.YMeters);
-            var bay = SmoothStep(harbor.RadiusMeters, 0.0, bayDistance);
-            height -= bay * 130.0;
-
-            var shelf = SmoothStep(harbor.RadiusMeters * 1.45, harbor.RadiusMeters * 0.3, bayDistance);
-            if (shelf > 0.0 && height > 8.0 && height < 180.0)
-            {
-                height = Lerp(height, 24.0 + detailNoise * 8.0, shelf * 0.55);
-            }
-        }
-
-        return Lerp(-220.0, height, land);
-    }
-
     private static List<IslandSeed> BuildSmallIslands(int seed)
     {
         var random = new Random(seed + 9001);
@@ -755,21 +481,11 @@ internal sealed class IslandWorldGenerator
         return (ushort)Math.Round(Clamp01(normalized) * ushort.MaxValue);
     }
 
-    private static string ClassifyBiome(double height, double moisture, double temperature, double rangeMask, double riverStrength, double lakeStrength)
+    private static string ClassifyBiome(double height, double moisture, double temperature, double rangeMask)
     {
         if (height <= 0.0)
         {
             return "ocean";
-        }
-
-        if (lakeStrength > 0.45)
-        {
-            return "lake";
-        }
-
-        if (riverStrength > 0.52 && height < 1_250.0)
-        {
-            return "river";
         }
 
         if (height < 18.0)
@@ -817,58 +533,6 @@ internal sealed class IslandWorldGenerator
         return Math.Sqrt(dx * dx + dy * dy);
     }
 
-    private RiverSample SampleRiver(RiverPath river, double worldX, double worldY)
-    {
-        var nx = worldX / _worldWidthMeters * 2.0 - 1.0;
-        var ny = worldY / _worldHeightMeters * 2.0 - 1.0;
-        var bestDistance = double.MaxValue;
-        var bestT = 0.0;
-        var totalLength = 0.0;
-
-        for (var i = 0; i < river.Points.Count - 1; i++)
-        {
-            totalLength += NormalizedDistance(river.Points[i], river.Points[i + 1]);
-        }
-
-        var traversed = 0.0;
-        for (var i = 0; i < river.Points.Count - 1; i++)
-        {
-            var a = river.Points[i];
-            var b = river.Points[i + 1];
-            var segmentLength = NormalizedDistance(a, b);
-            var vx = b.X - a.X;
-            var vy = b.Y - a.Y;
-            var lengthSquared = vx * vx + vy * vy;
-            var t = lengthSquared <= 0.0 ? 0.0 : Clamp01(((nx - a.X) * vx + (ny - a.Y) * vy) / lengthSquared);
-            var px = a.X + vx * t;
-            var py = a.Y + vy * t;
-            var distanceMeters = Distance(
-                nx * _worldWidthMeters * 0.5,
-                ny * _worldHeightMeters * 0.5,
-                px * _worldWidthMeters * 0.5,
-                py * _worldHeightMeters * 0.5);
-
-            if (distanceMeters < bestDistance)
-            {
-                bestDistance = distanceMeters;
-                bestT = totalLength <= 0.0 ? 0.0 : (traversed + segmentLength * t) / totalLength;
-            }
-
-            traversed += segmentLength;
-        }
-
-        return new RiverSample(bestDistance, Clamp01(bestT));
-    }
-
-    private double NormalizedDistance(NormalizedPoint a, NormalizedPoint b)
-    {
-        return Distance(
-            a.X * _worldWidthMeters * 0.5,
-            a.Y * _worldHeightMeters * 0.5,
-            b.X * _worldWidthMeters * 0.5,
-            b.Y * _worldHeightMeters * 0.5);
-    }
-
     private static double SmoothStep(double edge0, double edge1, double value)
     {
         var t = Clamp01((value - edge0) / (edge1 - edge0));
@@ -878,13 +542,6 @@ internal sealed class IslandWorldGenerator
     private static double Lerp(double a, double b, double t) => a + (b - a) * Clamp01(t);
     private static double Clamp01(double value) => Clamp(value, 0.0, 1.0);
     private static double Clamp(double value, double min, double max) => Math.Min(max, Math.Max(min, value));
-    private static NormalizedVector Normalize(double x, double y)
-    {
-        var length = Math.Sqrt(x * x + y * y);
-        return length <= 0.000001
-            ? new NormalizedVector(1.0, 0.0)
-            : new NormalizedVector(x / length, y / length);
-    }
 }
 
 internal static class Noise
@@ -944,16 +601,275 @@ internal static class Noise
     }
 }
 
-internal sealed record TerrainSample(double HeightMeters, string Biome);
+internal static class ErosionSimulator
+{
+    private static readonly int[] NeighborX = { -1, 0, 1, -1, 1, -1, 0, 1 };
+    private static readonly int[] NeighborY = { -1, -1, -1, 0, 0, 1, 1, 1 };
+    private static readonly double[] NeighborDistance = { Math.Sqrt(2.0), 1.0, Math.Sqrt(2.0), 1.0, 1.0, Math.Sqrt(2.0), 1.0, Math.Sqrt(2.0) };
+
+    public static void Run(TerrainMap map, int seed, int iterations)
+    {
+        if (iterations <= 0)
+        {
+            return;
+        }
+
+        var water = new double[map.Height, map.Width];
+        var sediment = new double[map.Height, map.Width];
+        var nextWater = new double[map.Height, map.Width];
+        var nextSediment = new double[map.Height, map.Width];
+
+        for (var iteration = 0; iteration < iterations; iteration++)
+        {
+            AddRainfall(map, water, seed, iteration);
+            Array.Copy(water, nextWater, water.Length);
+            Array.Copy(sediment, nextSediment, sediment.Length);
+
+            for (var y = 0; y < map.Height; y++)
+            {
+                for (var x = 0; x < map.Width; x++)
+                {
+                    MoveWater(map, water, sediment, nextWater, nextSediment, x, y);
+                }
+            }
+
+            (water, nextWater) = (nextWater, water);
+            (sediment, nextSediment) = (nextSediment, sediment);
+            ErodeAndDeposit(map, water, sediment);
+            Evaporate(water);
+        }
+
+        NormalizeFlow(map);
+    }
+
+    private static void AddRainfall(TerrainMap map, double[,] water, int seed, int iteration)
+    {
+        for (var y = 0; y < map.Height; y++)
+        {
+            var ny = y / (double)Math.Max(1, map.Height - 1);
+            for (var x = 0; x < map.Width; x++)
+            {
+                if (map.HeightMeters[y, x] <= 0.0 || map.LandMask[y, x] < 0.08)
+                {
+                    continue;
+                }
+
+                var nx = x / (double)Math.Max(1, map.Width - 1);
+                var rainfallNoise = Noise.Fractal(nx * 9.0 + iteration * 0.017, ny * 9.0 - iteration * 0.013, seed + 31003, 3, 0.55);
+                var rainfall = ErosionConstants.RainfallMeters * map.LandMask[y, x] * (0.78 + rainfallNoise * 0.22);
+                water[y, x] += Math.Max(0.0, rainfall);
+            }
+        }
+    }
+
+    private static void MoveWater(TerrainMap map, double[,] water, double[,] sediment, double[,] nextWater, double[,] nextSediment, int x, int y)
+    {
+        var currentWater = water[y, x];
+        if (currentWater <= 0.000001)
+        {
+            return;
+        }
+
+        var currentSurface = map.HeightMeters[y, x] + currentWater;
+        Span<double> weights = stackalloc double[8];
+        var totalWeight = 0.0;
+
+        for (var i = 0; i < 8; i++)
+        {
+            var nx = x + NeighborX[i];
+            var ny = y + NeighborY[i];
+            if (nx < 0 || ny < 0 || nx >= map.Width || ny >= map.Height)
+            {
+                continue;
+            }
+
+            var neighborSurface = map.HeightMeters[ny, nx] + water[ny, nx];
+            var drop = currentSurface - neighborSurface;
+            if (drop <= 0.0)
+            {
+                continue;
+            }
+
+            var weight = drop / NeighborDistance[i];
+            weights[i] = weight;
+            totalWeight += weight;
+        }
+
+        if (totalWeight <= 0.0)
+        {
+            return;
+        }
+
+        var outWater = Math.Min(currentWater, currentWater * ErosionConstants.FlowRate);
+        var outSediment = sediment[y, x] * outWater / Math.Max(currentWater, 0.000001);
+        nextWater[y, x] -= outWater;
+        nextSediment[y, x] -= outSediment;
+        map.FlowAccumulation[y, x] += outWater;
+
+        for (var i = 0; i < 8; i++)
+        {
+            if (weights[i] <= 0.0)
+            {
+                continue;
+            }
+
+            var nx = x + NeighborX[i];
+            var ny = y + NeighborY[i];
+            var share = weights[i] / totalWeight;
+            nextWater[ny, nx] += outWater * share;
+            nextSediment[ny, nx] += outSediment * share;
+        }
+    }
+
+    private static void ErodeAndDeposit(TerrainMap map, double[,] water, double[,] sediment)
+    {
+        for (var y = 0; y < map.Height; y++)
+        {
+            for (var x = 0; x < map.Width; x++)
+            {
+                var waterDepth = water[y, x];
+                if (waterDepth <= 0.000001 || map.HeightMeters[y, x] <= 0.0)
+                {
+                    sediment[y, x] *= 0.96;
+                    continue;
+                }
+
+                var slope = CalculateSlope(map, x, y);
+                var capacity = Math.Max(ErosionConstants.MinimumSedimentCapacity, waterDepth * slope * ErosionConstants.SedimentCapacityFactor);
+                if (sediment[y, x] > capacity)
+                {
+                    var deposit = (sediment[y, x] - capacity) * ErosionConstants.DepositionRate;
+                    sediment[y, x] -= deposit;
+                    map.HeightMeters[y, x] = Math.Min(MaxHeightMeters, map.HeightMeters[y, x] + deposit);
+                    map.SoilDepthMeters[y, x] = Math.Min(ErosionConstants.MaximumSoilDepthMeters, map.SoilDepthMeters[y, x] + deposit);
+                    continue;
+                }
+
+                var requestedErosion = (capacity - sediment[y, x]) * ErosionConstants.ErosionRate;
+                if (requestedErosion <= 0.0)
+                {
+                    continue;
+                }
+
+                var soilErosion = Math.Min(map.SoilDepthMeters[y, x], requestedErosion);
+                var rockErosion = Math.Max(0.0, requestedErosion - soilErosion) * ErosionConstants.RockErosionMultiplier;
+                var totalErosion = soilErosion + rockErosion;
+                map.SoilDepthMeters[y, x] -= soilErosion;
+                map.HeightMeters[y, x] = Math.Max(MinHeightMeters, map.HeightMeters[y, x] - totalErosion);
+                sediment[y, x] += totalErosion;
+            }
+        }
+    }
+
+    private static double CalculateSlope(TerrainMap map, int x, int y)
+    {
+        var height = map.HeightMeters[y, x];
+        var steepest = 0.0;
+
+        for (var i = 0; i < 8; i++)
+        {
+            var nx = x + NeighborX[i];
+            var ny = y + NeighborY[i];
+            if (nx < 0 || ny < 0 || nx >= map.Width || ny >= map.Height)
+            {
+                continue;
+            }
+
+            var drop = height - map.HeightMeters[ny, nx];
+            if (drop <= 0.0)
+            {
+                continue;
+            }
+
+            steepest = Math.Max(steepest, drop / (map.CellSizeMeters * NeighborDistance[i]));
+        }
+
+        return steepest;
+    }
+
+    private static void Evaporate(double[,] water)
+    {
+        for (var y = 0; y < water.GetLength(0); y++)
+        {
+            for (var x = 0; x < water.GetLength(1); x++)
+            {
+                water[y, x] *= 1.0 - ErosionConstants.EvaporationRate;
+            }
+        }
+    }
+
+    private static void NormalizeFlow(TerrainMap map)
+    {
+        var maxFlow = 0.0;
+        for (var y = 0; y < map.Height; y++)
+        {
+            for (var x = 0; x < map.Width; x++)
+            {
+                maxFlow = Math.Max(maxFlow, map.FlowAccumulation[y, x]);
+            }
+        }
+
+        if (maxFlow <= 0.0)
+        {
+            return;
+        }
+
+        var maxLog = Math.Log(1.0 + maxFlow);
+        for (var y = 0; y < map.Height; y++)
+        {
+            for (var x = 0; x < map.Width; x++)
+            {
+                map.FlowAccumulation[y, x] = Math.Log(1.0 + map.FlowAccumulation[y, x]) / maxLog;
+            }
+        }
+    }
+}
+
+internal static class ErosionConstants
+{
+    public const double RainfallMeters = 0.035;
+    public const double FlowRate = 0.58;
+    public const double EvaporationRate = 0.045;
+    public const double SedimentCapacityFactor = 4.2;
+    public const double MinimumSedimentCapacity = 0.0008;
+    public const double ErosionRate = 0.055;
+    public const double DepositionRate = 0.14;
+    public const double RockErosionMultiplier = 0.08;
+    public const double MaximumSoilDepthMeters = 14.0;
+}
+
+internal sealed class TerrainMap
+{
+    public TerrainMap(int width, int height, double cellSizeMeters)
+    {
+        Width = width;
+        Height = height;
+        CellSizeMeters = cellSizeMeters;
+        HeightMeters = new double[height, width];
+        BaseMoisture = new double[height, width];
+        Temperature = new double[height, width];
+        MountainMask = new double[height, width];
+        LandMask = new double[height, width];
+        FlowAccumulation = new double[height, width];
+        SoilDepthMeters = new double[height, width];
+    }
+
+    public int Width { get; }
+    public int Height { get; }
+    public double CellSizeMeters { get; }
+    public double[,] HeightMeters { get; }
+    public double[,] BaseMoisture { get; }
+    public double[,] Temperature { get; }
+    public double[,] MountainMask { get; }
+    public double[,] LandMask { get; }
+    public double[,] FlowAccumulation { get; }
+    public double[,] SoilDepthMeters { get; }
+}
+
+internal sealed record BaseTerrainSample(double HeightMeters, double Moisture, double Temperature, double MountainMask, double LandMask);
 internal sealed record IslandSeed(double X, double Y, double Radius);
 internal sealed record HarborSite(string Name, double XMeters, double YMeters, double RadiusMeters, double Shelter);
 internal sealed record MountainPeak(double X, double Y, double Radius, double HeightMeters, double Ruggedness, int NoiseOffset);
-internal sealed record NormalizedPoint(double X, double Y);
-internal sealed record NormalizedVector(double X, double Y);
-internal sealed record LakeBasin(string Name, double XMeters, double YMeters, double RadiusMeters, double WaterHeightMeters);
-internal sealed record RiverLakeCrossing(NormalizedPoint Center, NormalizedPoint Outlet, LakeBasin Basin);
-internal sealed record RiverPath(string Name, double WidthMeters, double SourceHeightMeters, List<NormalizedPoint> Points);
-internal sealed record RiverSample(double DistanceMeters, double T);
 
 internal static class TerrainConstants
 {
@@ -977,6 +893,8 @@ internal static class TerrainConstants
     public const int DefaultChunksX = 5;
     public const int DefaultChunksY = 5;
     public const int DefaultSamplesPerChunk = 257;
+    public const int DefaultErosionIterations = 96;
+    public const int MaxGlobalErosionSamples = 10_000_000;
     public const double ChunkSizeMeters = 10_000.0;
     public const double MetersPerGodotUnit = 10.0;
     public const double MinHeightMeters = -250.0;
@@ -989,6 +907,7 @@ internal sealed record WorldManifest(
     GeneratorInfo Generator,
     ScaleInfo Scale,
     HeightInfo Height,
+    ErosionInfo Erosion,
     BiomeInfo Biome,
     ChunkGridInfo ChunkGrid,
     List<ChunkMetadata> Chunks,
@@ -1000,10 +919,11 @@ internal sealed record WorldManifest(
 internal sealed record GeneratorInfo(string Tool, int Seed, string Algorithm);
 internal sealed record ScaleInfo(double MetersPerGodotUnit, double ChunkSizeMeters, double WorldWidthMeters, double WorldHeightMeters);
 internal sealed record HeightInfo(double MinHeight, double MaxHeight, string SampleFormat, string DecodeRule);
+internal sealed record ErosionInfo(int Iterations, string DerivedMapFormat, string DecodeRule);
 internal sealed record BiomeInfo(string SampleFormat, string DecodeRule, List<BiomePaletteEntry> Palette);
 internal sealed record BiomePaletteEntry(int Index, string Id);
 internal sealed record ChunkGridInfo(int ChunksX, int ChunksY, int SamplesX, int SamplesY);
-internal sealed record ChunkMetadata(int X, int Y, string HeightFile, string BiomeFile, string DominantBiome);
+internal sealed record ChunkMetadata(int X, int Y, string HeightFile, string BiomeFile, string FlowFile, string SoilFile, string DominantBiome);
 internal sealed record HarborMetadata(string Id, string Name, double XMeters, double YMeters, double RadiusMeters, double Shelter);
 internal sealed record RiverMetadata(string Id, string Name, double WidthMeters, List<RiverPointMetadata> Points);
 internal sealed record RiverPointMetadata(double XMeters, double YMeters);
