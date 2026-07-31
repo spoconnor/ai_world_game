@@ -8,10 +8,10 @@ Default manifest path:
 ../world_data/prototype/world.json
 ```
 
-Generate data first from the repository root once the .NET SDK is available:
+Generate data first once the .NET SDK is available:
 
 ```bash
-dotnet run --project terrain_tool -- --output world_data/prototype --chunks-x 5 --chunks-y 5 --seed 12345
+dotnet run --project terrain_tool -- --chunks-x 5 --chunks-y 5 --seed 12345
 ```
 
 Then open `godot/project.godot` in Godot 4.7 and run the main scene.

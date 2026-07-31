@@ -35,7 +35,7 @@ internal sealed record ToolOptions(
 {
     public static ToolOptions Parse(string[] args)
     {
-        var output = Path.Combine("world_data", "prototype");
+        var output = GetDefaultOutputDirectory();
         var chunksX = DefaultChunksX;
         var chunksY = DefaultChunksY;
         var samples = DefaultSamplesPerChunk;
@@ -119,13 +119,39 @@ internal sealed record ToolOptions(
     private static void PrintHelp()
     {
         Console.WriteLine("WorldTerrainTool");
-        Console.WriteLine("  --output <path>       Output directory. Default: world_data/prototype");
+        Console.WriteLine($"  --output <path>       Output directory. Default: {GetDefaultOutputDirectory()}");
         Console.WriteLine("  --chunks-x <count>    Chunk columns. Default: 5");
         Console.WriteLine("  --chunks-y <count>    Chunk rows. Default: 5");
         Console.WriteLine("  --samples <count>     Height samples per chunk edge. Default: 257");
         Console.WriteLine("  --seed <number>       Deterministic generation seed. Default: 12345");
         Console.WriteLine("  --erosion-iterations <count>");
         Console.WriteLine("                        Hydraulic erosion iterations. Default: 96");
+    }
+
+    private static string GetDefaultOutputDirectory()
+    {
+        var repoRoot = FindRepositoryRoot(AppContext.BaseDirectory)
+            ?? FindRepositoryRoot(Environment.CurrentDirectory)
+            ?? Environment.CurrentDirectory;
+        return Path.GetFullPath(Path.Combine(repoRoot, "world_data", "prototype"));
+    }
+
+    private static string? FindRepositoryRoot(string startDirectory)
+    {
+        var directory = new DirectoryInfo(Path.GetFullPath(startDirectory));
+        while (directory != null)
+        {
+            var hasTerrainTool = Directory.Exists(Path.Combine(directory.FullName, "terrain_tool"));
+            var hasGodotProject = File.Exists(Path.Combine(directory.FullName, "godot", "project.godot"));
+            if (hasTerrainTool && hasGodotProject)
+            {
+                return directory.FullName;
+            }
+
+            directory = directory.Parent;
+        }
+
+        return null;
     }
 }
 
@@ -137,15 +163,19 @@ internal sealed class IslandWorldGenerator
     private readonly List<HarborSite> _harborSites;
     private readonly List<IslandSeed> _smallIslands;
     private readonly List<MountainPeak> _randomMountains;
+    private readonly List<TectonicPlate> _tectonicPlates;
+    private readonly List<VolcanoSite> _volcanoes;
 
     public IslandWorldGenerator(ToolOptions options)
     {
         _options = options;
         _worldWidthMeters = options.ChunksX * ChunkSizeMeters;
         _worldHeightMeters = options.ChunksY * ChunkSizeMeters;
+        _tectonicPlates = BuildTectonicPlates(options.Seed);
         _smallIslands = BuildSmallIslands(options.Seed);
         _harborSites = BuildHarborSites(options.Seed);
         _randomMountains = BuildRandomMountains(options.Seed);
+        _volcanoes = BuildVolcanoes(options.Seed);
     }
 
     public WorldManifest Generate()
@@ -174,16 +204,21 @@ internal sealed class IslandWorldGenerator
                     $"chunks/chunk_x{chunkX:000}_y{chunkY:000}.biome",
                     $"chunks/chunk_x{chunkX:000}_y{chunkY:000}.flow",
                     $"chunks/chunk_x{chunkX:000}_y{chunkY:000}.soil",
+                    $"chunks/chunk_x{chunkX:000}_y{chunkY:000}.uplift",
+                    $"chunks/chunk_x{chunkX:000}_y{chunkY:000}.fault",
+                    $"chunks/chunk_x{chunkX:000}_y{chunkY:000}.volcanic",
+                    $"chunks/chunk_x{chunkX:000}_y{chunkY:000}.glacier",
                     dominantBiome));
             }
         }
 
         return new WorldManifest(
             FormatVersion,
-            new GeneratorInfo("WorldTerrainTool", _options.Seed, "island_archipelago_v1"),
+            new GeneratorInfo("WorldTerrainTool", _options.Seed, "tectonic_island_archipelago_v2"),
             new ScaleInfo(MetersPerGodotUnit, ChunkSizeMeters, _worldWidthMeters, _worldHeightMeters),
             new HeightInfo(MinHeightMeters, MaxHeightMeters, "uint16_little_endian", "height = min_height + sample / 65535.0 * (max_height - min_height)"),
             new ErosionInfo(_options.ErosionIterations, "float32_little_endian", "flow_accumulation stores normalized accumulated water flow per sample; soil_depth stores loose/deposited soil depth in meters per sample."),
+            new GeologyInfo("float32_little_endian", "tectonic_uplift, fault, volcanic, and glacier files store normalized 0..1 derived geology masks per sample."),
             new BiomeInfo("uint8_palette_index", "One biome palette index per height sample, row-major order.", BuildBiomePalette()),
             new ChunkGridInfo(_options.ChunksX, _options.ChunksY, _options.SamplesPerChunk, _options.SamplesPerChunk),
             chunkMetadata,
@@ -201,6 +236,10 @@ internal sealed class IslandWorldGenerator
         var biomePath = Path.Combine(chunksDirectory, $"chunk_x{chunkX:000}_y{chunkY:000}.biome");
         var flowPath = Path.Combine(chunksDirectory, $"chunk_x{chunkX:000}_y{chunkY:000}.flow");
         var soilPath = Path.Combine(chunksDirectory, $"chunk_x{chunkX:000}_y{chunkY:000}.soil");
+        var upliftPath = Path.Combine(chunksDirectory, $"chunk_x{chunkX:000}_y{chunkY:000}.uplift");
+        var faultPath = Path.Combine(chunksDirectory, $"chunk_x{chunkX:000}_y{chunkY:000}.fault");
+        var volcanicPath = Path.Combine(chunksDirectory, $"chunk_x{chunkX:000}_y{chunkY:000}.volcanic");
+        var glacierPath = Path.Combine(chunksDirectory, $"chunk_x{chunkX:000}_y{chunkY:000}.glacier");
 
         using var heightStream = File.Create(heightPath);
         using var heightWriter = new BinaryWriter(heightStream);
@@ -210,6 +249,14 @@ internal sealed class IslandWorldGenerator
         using var flowWriter = new BinaryWriter(flowStream);
         using var soilStream = File.Create(soilPath);
         using var soilWriter = new BinaryWriter(soilStream);
+        using var upliftStream = File.Create(upliftPath);
+        using var upliftWriter = new BinaryWriter(upliftStream);
+        using var faultStream = File.Create(faultPath);
+        using var faultWriter = new BinaryWriter(faultStream);
+        using var volcanicStream = File.Create(volcanicPath);
+        using var volcanicWriter = new BinaryWriter(volcanicStream);
+        using var glacierStream = File.Create(glacierPath);
+        using var glacierWriter = new BinaryWriter(glacierStream);
 
         for (var localY = 0; localY < samples; localY++)
         {
@@ -223,6 +270,10 @@ internal sealed class IslandWorldGenerator
                 biomeWriter.Write(GetBiomeIndex(biome));
                 flowWriter.Write((float)terrainMap.FlowAccumulation[sampleY, sampleX]);
                 soilWriter.Write((float)terrainMap.SoilDepthMeters[sampleY, sampleX]);
+                upliftWriter.Write((float)terrainMap.TectonicUplift[sampleY, sampleX]);
+                faultWriter.Write((float)terrainMap.FaultMask[sampleY, sampleX]);
+                volcanicWriter.Write((float)terrainMap.VolcanicActivity[sampleY, sampleX]);
+                glacierWriter.Write((float)terrainMap.GlacierMask[sampleY, sampleX]);
 
                 biomeVotes[biome] = biomeVotes.GetValueOrDefault(biome) + 1;
                 biomeCounts[biome] = biomeCounts.GetValueOrDefault(biome) + 1;
@@ -272,6 +323,9 @@ internal sealed class IslandWorldGenerator
                 map.Temperature[y, x] = sample.Temperature;
                 map.MountainMask[y, x] = sample.MountainMask;
                 map.LandMask[y, x] = sample.LandMask;
+                map.TectonicUplift[y, x] = sample.TectonicUplift;
+                map.FaultMask[y, x] = sample.FaultMask;
+                map.VolcanicActivity[y, x] = sample.VolcanicActivity;
                 map.SoilDepthMeters[y, x] = sample.HeightMeters > 0.0
                     ? Lerp(0.45, 4.8, SmoothStep(0.08, 0.55, sample.LandMask))
                     : 0.0;
@@ -279,6 +333,7 @@ internal sealed class IslandWorldGenerator
         }
 
         ErosionSimulator.Run(map, _options.Seed, _options.ErosionIterations);
+        GlacialCarvingSimulator.Run(map, _options.Seed);
         return map;
     }
 
@@ -316,6 +371,7 @@ internal sealed class IslandWorldGenerator
         var land = Clamp01(Math.Max(mainIsland, smallIslandMask));
         var coastNoise = Noise.Fractal(nx * 8.0, ny * 8.0, _options.Seed + 101, 5, 0.52);
         land = Clamp01(land + coastNoise * 0.08);
+        var tectonics = EvaluateTectonics(nx, ny);
 
         var mountainCenterY = 0.08 * Math.Sin(nx * Math.PI * 1.5) - 0.08 * nx;
         var mountainDistance = Math.Abs(ny - mountainCenterY);
@@ -345,6 +401,11 @@ internal sealed class IslandWorldGenerator
             randomPeakMask = Math.Max(randomPeakMask, peakMask);
         }
 
+        var tectonicRuggedness = Noise.Fractal(nx * 26.0 + 5.0, ny * 26.0 - 8.0, _options.Seed + 619, 4, 0.50);
+        var tectonicUplift = tectonics.UpliftMask * (0.86 + tectonicRuggedness * 0.18);
+        var riftDepression = tectonics.RiftMask * (0.72 + Math.Abs(tectonicRuggedness) * 0.28);
+        var faultScarp = tectonics.TransformMask * Noise.Fractal(nx * 42.0, ny * 42.0, _options.Seed + 631, 2, 0.45);
+
         var lowlandNoise = Noise.Fractal(nx * 5.0, ny * 5.0, _options.Seed + 301, 5, 0.5);
         var detailNoise = Noise.Fractal(nx * 18.0, ny * 18.0, _options.Seed + 401, 4, 0.45);
         var coastalShelf = SmoothStep(0.08, 0.35, land);
@@ -353,9 +414,32 @@ internal sealed class IslandWorldGenerator
             + land * 320.0
             + coastalShelf * lowlandNoise * 260.0
             + coastalShelf * detailNoise * 90.0
-            + ridge * 2_850.0
-            + secondaryRidge * 1_950.0
-            + randomPeakHeight;
+            + ridge * 2_550.0
+            + secondaryRidge * 1_750.0
+            + randomPeakHeight
+            + tectonicUplift * land * 1_250.0
+            - riftDepression * land * 360.0
+            + faultScarp * land * 220.0;
+
+        var volcanicActivity = 0.0;
+        foreach (var volcano in _volcanoes)
+        {
+            var volcanoDistance = Distance(nx, ny, volcano.X, volcano.Y);
+            var apron = SmoothStep(volcano.Radius * 2.8, volcano.Radius * 0.58, volcanoDistance);
+            if (apron <= 0.0)
+            {
+                continue;
+            }
+
+            var cone = SmoothStep(volcano.Radius * 1.15, volcano.Radius * 0.08, volcanoDistance);
+            var crater = SmoothStep(volcano.Radius * 0.16, 0.0, volcanoDistance);
+            var lavaNoise = Noise.Fractal(nx * 34.0 + volcano.NoiseOffset, ny * 34.0 - volcano.NoiseOffset, _options.Seed + 643, 3, 0.48);
+            var skirt = Math.Pow(apron, 2.2);
+            height += skirt * volcano.HeightMeters * 0.22;
+            height += Math.Pow(cone, 1.35) * volcano.HeightMeters * (0.58 + lavaNoise * 0.10);
+            height -= crater * volcano.HeightMeters * 0.22;
+            volcanicActivity = Math.Max(volcanicActivity, Math.Max(cone, apron * 0.55));
+        }
 
         foreach (var harbor in _harborSites)
         {
@@ -371,12 +455,78 @@ internal sealed class IslandWorldGenerator
         }
 
         height = Lerp(-220.0, height, land);
-        var mountainRainShadow = Math.Max(rangeMask, Math.Max(secondaryRangeMask * 0.75, randomPeakMask * 0.45));
+        var combinedMountainMask = Math.Max(Math.Max(rangeMask, Math.Max(secondaryRangeMask, randomPeakMask)), Math.Max(tectonicUplift, volcanicActivity * 0.65));
+        var mountainRainShadow = Math.Max(combinedMountainMask, tectonics.BoundaryMask * 0.5);
         var moisture = Clamp01(0.55 + Noise.Fractal(nx * 4.0 - 2.0, ny * 4.0 + 5.0, _options.Seed + 503, 4, 0.5) * 0.32 - mountainRainShadow * Math.Max(0.0, nx) * 0.35);
         var temperature = Clamp01(0.72 - Math.Abs(ny) * 0.25 - Math.Max(0.0, height) / 4_500.0);
-        var combinedMountainMask = Math.Max(rangeMask, Math.Max(secondaryRangeMask, randomPeakMask));
 
-        return new BaseTerrainSample(Clamp(height, MinHeightMeters, MaxHeightMeters), moisture, temperature, combinedMountainMask, land);
+        return new BaseTerrainSample(
+            SoftLimitHeight(height),
+            moisture,
+            temperature,
+            combinedMountainMask,
+            land,
+            tectonicUplift,
+            Math.Max(tectonics.TransformMask, tectonics.BoundaryMask * 0.45),
+            volcanicActivity);
+    }
+
+    private TectonicSample EvaluateTectonics(double nx, double ny)
+    {
+        var nearestIndex = 0;
+        var secondIndex = 0;
+        var nearestDistance = double.MaxValue;
+        var secondDistance = double.MaxValue;
+
+        for (var i = 0; i < _tectonicPlates.Count; i++)
+        {
+            var plate = _tectonicPlates[i];
+            var dx = nx - plate.X;
+            var dy = ny - plate.Y;
+            var distance = dx * dx + dy * dy;
+            if (distance < nearestDistance)
+            {
+                secondDistance = nearestDistance;
+                secondIndex = nearestIndex;
+                nearestDistance = distance;
+                nearestIndex = i;
+            }
+            else if (distance < secondDistance)
+            {
+                secondDistance = distance;
+                secondIndex = i;
+            }
+        }
+
+        var first = _tectonicPlates[nearestIndex];
+        var second = _tectonicPlates[secondIndex];
+        var gap = Math.Sqrt(secondDistance) - Math.Sqrt(nearestDistance);
+        var boundary = SmoothStep(0.14, 0.01, gap);
+        if (boundary <= 0.0)
+        {
+            return new TectonicSample(0.0, 0.0, 0.0, 0.0, first.Id);
+        }
+
+        var normalX = second.X - first.X;
+        var normalY = second.Y - first.Y;
+        var normalLength = Math.Sqrt(normalX * normalX + normalY * normalY);
+        if (normalLength <= 0.000001)
+        {
+            return new TectonicSample(0.0, 0.0, 0.0, 0.0, first.Id);
+        }
+
+        normalX /= normalLength;
+        normalY /= normalLength;
+        var relativeX = first.VelocityX - second.VelocityX;
+        var relativeY = first.VelocityY - second.VelocityY;
+        var convergence = (relativeX * normalX + relativeY * normalY) * 0.5 + 0.5;
+        var shear = Math.Abs(relativeX * -normalY + relativeY * normalX);
+        var crustContrast = Math.Abs(first.ContinentalBias - second.ContinentalBias);
+        var uplift = boundary * SmoothStep(0.56, 0.92, convergence) * Lerp(0.78, 1.20, crustContrast);
+        var rift = boundary * SmoothStep(0.44, 0.12, convergence);
+        var transform = boundary * SmoothStep(0.35, 0.95, shear) * (1.0 - Math.Max(uplift, rift) * 0.45);
+
+        return new TectonicSample(boundary, Clamp01(uplift), Clamp01(rift), Clamp01(transform), first.Id);
     }
 
     private List<HarborMetadata> BuildHarbors()
@@ -457,6 +607,74 @@ internal sealed class IslandWorldGenerator
         return peaks;
     }
 
+    private List<TectonicPlate> BuildTectonicPlates(int seed)
+    {
+        var random = new Random(seed + 17017);
+        var plates = new List<TectonicPlate>();
+        var plateCount = 11;
+
+        for (var i = 0; i < plateCount; i++)
+        {
+            var movementAngle = random.NextDouble() * Math.PI * 2.0;
+            var speed = 0.45 + random.NextDouble() * 0.95;
+            var centerAngle = random.NextDouble() * Math.PI * 2.0;
+            var centerRadius = Math.Sqrt(random.NextDouble()) * 1.25;
+            plates.Add(new TectonicPlate(
+                i,
+                Math.Cos(centerAngle) * centerRadius,
+                Math.Sin(centerAngle) * centerRadius,
+                Math.Cos(movementAngle) * speed,
+                Math.Sin(movementAngle) * speed,
+                random.NextDouble()));
+        }
+
+        return plates;
+    }
+
+    private List<VolcanoSite> BuildVolcanoes(int seed)
+    {
+        var random = new Random(seed + 19019);
+        var candidates = new List<(double X, double Y, double Potential)>();
+
+        for (var i = 0; i < 520; i++)
+        {
+            var x = random.NextDouble() * 2.0 - 1.0;
+            var y = random.NextDouble() * 2.0 - 1.0;
+            var tectonics = EvaluateTectonics(x, y);
+            var islandBias = SmoothStep(1.16, 0.32, Math.Sqrt(x * x + y * y));
+            var potential = Math.Max(tectonics.UpliftMask * 0.9, tectonics.RiftMask * 0.55) * islandBias;
+            if (potential > 0.32)
+            {
+                candidates.Add((x, y, potential));
+            }
+        }
+
+        var volcanoes = candidates
+            .OrderByDescending(candidate => candidate.Potential + random.NextDouble() * 0.12)
+            .Take(14)
+            .Select((candidate, index) => new VolcanoSite(
+                candidate.X,
+                candidate.Y,
+                0.035 + random.NextDouble() * 0.075,
+                380.0 + candidate.Potential * 1_250.0 + random.NextDouble() * 520.0,
+                random.Next(1_000, 90_000) + index * 97))
+            .ToList();
+
+        for (var i = 0; i < 3; i++)
+        {
+            var angle = random.NextDouble() * Math.PI * 2.0;
+            var radius = random.NextDouble() * 0.58;
+            volcanoes.Add(new VolcanoSite(
+                Math.Cos(angle) * radius,
+                Math.Sin(angle) * radius * 0.8,
+                0.045 + random.NextDouble() * 0.055,
+                520.0 + random.NextDouble() * 840.0,
+                random.Next(1_000, 90_000)));
+        }
+
+        return volcanoes;
+    }
+
     private static List<IslandSeed> BuildSmallIslands(int seed)
     {
         var random = new Random(seed + 9001);
@@ -479,6 +697,18 @@ internal sealed class IslandWorldGenerator
     {
         var normalized = (heightMeters - MinHeightMeters) / (MaxHeightMeters - MinHeightMeters);
         return (ushort)Math.Round(Clamp01(normalized) * ushort.MaxValue);
+    }
+
+    private static double SoftLimitHeight(double heightMeters)
+    {
+        if (heightMeters <= HeightSoftLimitMeters)
+        {
+            return Clamp(heightMeters, MinHeightMeters, MaxHeightMeters);
+        }
+
+        var excess = heightMeters - HeightSoftLimitMeters;
+        var compressed = HeightSoftLimitMeters + SoftCeilingRangeMeters * (1.0 - Math.Exp(-excess / SoftCeilingRangeMeters));
+        return Clamp(compressed, MinHeightMeters, MaxHeightMeters);
     }
 
     private static string ClassifyBiome(double height, double moisture, double temperature, double rangeMask)
@@ -825,6 +1055,207 @@ internal static class ErosionSimulator
     }
 }
 
+internal static class GlacialCarvingSimulator
+{
+    private static readonly int[] NeighborX = { -1, 0, 1, -1, 1, -1, 0, 1 };
+    private static readonly int[] NeighborY = { -1, -1, -1, 0, 0, 1, 1, 1 };
+
+    public static void Run(TerrainMap map, int seed)
+    {
+        var stride = Math.Max(3, Math.Min(map.Width, map.Height) / 96);
+        var random = new Random(seed + 7603);
+        for (var y = stride; y < map.Height - stride; y += stride)
+        {
+            for (var x = stride; x < map.Width - stride; x += stride)
+            {
+                var jitterX = random.Next(-stride / 2, stride / 2 + 1);
+                var jitterY = random.Next(-stride / 2, stride / 2 + 1);
+                var sampleX = Math.Min(map.Width - stride - 1, Math.Max(stride, x + jitterX));
+                var sampleY = Math.Min(map.Height - stride - 1, Math.Max(stride, y + jitterY));
+                var accumulation = GetAccumulationPotential(map, sampleX, sampleY, seed);
+                if (accumulation <= 0.0)
+                {
+                    continue;
+                }
+
+                CarveGlacierPath(map, sampleX, sampleY, accumulation);
+            }
+        }
+
+        SmoothGlaciatedCells(map);
+    }
+
+    private static double GetAccumulationPotential(TerrainMap map, int x, int y, int seed)
+    {
+        var height = map.HeightMeters[y, x];
+        if (height < 1_150.0 || map.LandMask[y, x] < 0.35)
+        {
+            return 0.0;
+        }
+
+        var volcanicQuiet = 1.0 - SmoothStep(0.05, 0.28, map.VolcanicActivity[y, x]);
+        if (volcanicQuiet <= 0.0)
+        {
+            return 0.0;
+        }
+
+        var cold = SmoothStep(0.50, 0.20, map.Temperature[y, x]);
+        var elevation = SmoothStep(1_150.0, 2_450.0, height);
+        var moisture = SmoothStep(0.32, 0.74, map.BaseMoisture[y, x]);
+        var nx = x / (double)Math.Max(1, map.Width - 1);
+        var ny = y / (double)Math.Max(1, map.Height - 1);
+        var snowNoise = Noise.Fractal(nx * 13.0, ny * 13.0, seed + 7301, 3, 0.52) * 0.18 + 0.9;
+        return Clamp01(cold * elevation * (0.42 + moisture * 0.58) * snowNoise * volcanicQuiet);
+    }
+
+    private static void CarveGlacierPath(TerrainMap map, int startX, int startY, double strength)
+    {
+        var x = startX;
+        var y = startY;
+        var currentStrength = strength;
+        var maxSteps = Math.Max(18, Math.Min(map.Width, map.Height) / 4);
+
+        for (var step = 0; step < maxSteps; step++)
+        {
+            if (x <= 2 || y <= 2 || x >= map.Width - 3 || y >= map.Height - 3)
+            {
+                break;
+            }
+
+            var height = map.HeightMeters[y, x];
+            if (height <= 12.0 || currentStrength <= 0.045)
+            {
+                break;
+            }
+
+            var volcanicQuiet = 1.0 - SmoothStep(0.05, 0.28, map.VolcanicActivity[y, x]);
+            if (volcanicQuiet <= 0.0)
+            {
+                break;
+            }
+
+            var radius = 1 + (int)Math.Round(currentStrength * 3.0 + SmoothStep(2_600.0, 1_000.0, height));
+            var depth = currentStrength * volcanicQuiet * SmoothStep(300.0, 2_600.0, height) * 5.8;
+            CarveCrossSection(map, x, y, radius, depth);
+            map.GlacierMask[y, x] = Math.Max(map.GlacierMask[y, x], currentStrength);
+
+            if (!TryFindDownhillNeighbor(map, x, y, out var nextX, out var nextY))
+            {
+                break;
+            }
+
+            x = nextX;
+            y = nextY;
+            currentStrength *= 0.972;
+        }
+    }
+
+    private static void CarveCrossSection(TerrainMap map, int centerX, int centerY, int radius, double depth)
+    {
+        var centerHeight = map.HeightMeters[centerY, centerX];
+        for (var y = centerY - radius; y <= centerY + radius; y++)
+        {
+            for (var x = centerX - radius; x <= centerX + radius; x++)
+            {
+                if (x < 0 || y < 0 || x >= map.Width || y >= map.Height)
+                {
+                    continue;
+                }
+
+                var dx = x - centerX;
+                var dy = y - centerY;
+                var distance = Math.Sqrt(dx * dx + dy * dy);
+                if (distance > radius)
+                {
+                    continue;
+                }
+
+                var normalized = distance / Math.Max(1.0, radius);
+                var uShape = 1.0 - normalized * normalized;
+                var volcanicQuiet = 1.0 - SmoothStep(0.05, 0.28, map.VolcanicActivity[y, x]);
+                if (volcanicQuiet <= 0.0)
+                {
+                    continue;
+                }
+
+                var target = centerHeight - depth * uShape;
+                map.HeightMeters[y, x] = Math.Min(map.HeightMeters[y, x], Math.Max(0.0, target));
+                map.SoilDepthMeters[y, x] *= 1.0 - uShape * volcanicQuiet * 0.42;
+                map.GlacierMask[y, x] = Math.Max(map.GlacierMask[y, x], uShape * volcanicQuiet);
+            }
+        }
+    }
+
+    private static bool TryFindDownhillNeighbor(TerrainMap map, int x, int y, out int nextX, out int nextY)
+    {
+        nextX = x;
+        nextY = y;
+        var bestDrop = 0.0;
+        var height = map.HeightMeters[y, x];
+
+        for (var i = 0; i < NeighborX.Length; i++)
+        {
+            var nx = x + NeighborX[i];
+            var ny = y + NeighborY[i];
+            if (nx < 0 || ny < 0 || nx >= map.Width || ny >= map.Height)
+            {
+                continue;
+            }
+
+            var drop = height - map.HeightMeters[ny, nx];
+            if (drop > bestDrop)
+            {
+                bestDrop = drop;
+                nextX = nx;
+                nextY = ny;
+            }
+        }
+
+        return bestDrop > 0.05;
+    }
+
+    private static void SmoothGlaciatedCells(TerrainMap map)
+    {
+        var smoothed = new double[map.Height, map.Width];
+        Array.Copy(map.HeightMeters, smoothed, map.HeightMeters.Length);
+
+        for (var y = 1; y < map.Height - 1; y++)
+        {
+            for (var x = 1; x < map.Width - 1; x++)
+            {
+                var glacier = map.GlacierMask[y, x];
+                if (glacier <= 0.0)
+                {
+                    continue;
+                }
+
+                var average = 0.0;
+                for (var oy = -1; oy <= 1; oy++)
+                {
+                    for (var ox = -1; ox <= 1; ox++)
+                    {
+                        average += map.HeightMeters[y + oy, x + ox];
+                    }
+                }
+
+                average /= 9.0;
+                smoothed[y, x] = Lerp(map.HeightMeters[y, x], average, glacier * 0.34);
+            }
+        }
+
+        Array.Copy(smoothed, map.HeightMeters, map.HeightMeters.Length);
+    }
+
+    private static double SmoothStep(double edge0, double edge1, double value)
+    {
+        var t = Clamp01((value - edge0) / (edge1 - edge0));
+        return t * t * (3.0 - 2.0 * t);
+    }
+
+    private static double Lerp(double a, double b, double t) => a + (b - a) * Clamp01(t);
+    private static double Clamp01(double value) => Math.Min(1.0, Math.Max(0.0, value));
+}
+
 internal static class ErosionConstants
 {
     public const double RainfallMeters = 0.035;
@@ -850,6 +1281,10 @@ internal sealed class TerrainMap
         Temperature = new double[height, width];
         MountainMask = new double[height, width];
         LandMask = new double[height, width];
+        TectonicUplift = new double[height, width];
+        FaultMask = new double[height, width];
+        VolcanicActivity = new double[height, width];
+        GlacierMask = new double[height, width];
         FlowAccumulation = new double[height, width];
         SoilDepthMeters = new double[height, width];
     }
@@ -862,14 +1297,21 @@ internal sealed class TerrainMap
     public double[,] Temperature { get; }
     public double[,] MountainMask { get; }
     public double[,] LandMask { get; }
+    public double[,] TectonicUplift { get; }
+    public double[,] FaultMask { get; }
+    public double[,] VolcanicActivity { get; }
+    public double[,] GlacierMask { get; }
     public double[,] FlowAccumulation { get; }
     public double[,] SoilDepthMeters { get; }
 }
 
-internal sealed record BaseTerrainSample(double HeightMeters, double Moisture, double Temperature, double MountainMask, double LandMask);
+internal sealed record BaseTerrainSample(double HeightMeters, double Moisture, double Temperature, double MountainMask, double LandMask, double TectonicUplift, double FaultMask, double VolcanicActivity);
+internal sealed record TectonicSample(double BoundaryMask, double UpliftMask, double RiftMask, double TransformMask, int PlateId);
 internal sealed record IslandSeed(double X, double Y, double Radius);
 internal sealed record HarborSite(string Name, double XMeters, double YMeters, double RadiusMeters, double Shelter);
 internal sealed record MountainPeak(double X, double Y, double Radius, double HeightMeters, double Ruggedness, int NoiseOffset);
+internal sealed record TectonicPlate(int Id, double X, double Y, double VelocityX, double VelocityY, double ContinentalBias);
+internal sealed record VolcanoSite(double X, double Y, double Radius, double HeightMeters, int NoiseOffset);
 
 internal static class TerrainConstants
 {
@@ -899,6 +1341,8 @@ internal static class TerrainConstants
     public const double MetersPerGodotUnit = 10.0;
     public const double MinHeightMeters = -250.0;
     public const double MaxHeightMeters = 3_600.0;
+    public const double HeightSoftLimitMeters = 3_180.0;
+    public const double SoftCeilingRangeMeters = MaxHeightMeters - HeightSoftLimitMeters;
     public const int FormatVersion = 1;
 }
 
@@ -908,6 +1352,7 @@ internal sealed record WorldManifest(
     ScaleInfo Scale,
     HeightInfo Height,
     ErosionInfo Erosion,
+    GeologyInfo Geology,
     BiomeInfo Biome,
     ChunkGridInfo ChunkGrid,
     List<ChunkMetadata> Chunks,
@@ -920,10 +1365,11 @@ internal sealed record GeneratorInfo(string Tool, int Seed, string Algorithm);
 internal sealed record ScaleInfo(double MetersPerGodotUnit, double ChunkSizeMeters, double WorldWidthMeters, double WorldHeightMeters);
 internal sealed record HeightInfo(double MinHeight, double MaxHeight, string SampleFormat, string DecodeRule);
 internal sealed record ErosionInfo(int Iterations, string DerivedMapFormat, string DecodeRule);
+internal sealed record GeologyInfo(string DerivedMapFormat, string DecodeRule);
 internal sealed record BiomeInfo(string SampleFormat, string DecodeRule, List<BiomePaletteEntry> Palette);
 internal sealed record BiomePaletteEntry(int Index, string Id);
 internal sealed record ChunkGridInfo(int ChunksX, int ChunksY, int SamplesX, int SamplesY);
-internal sealed record ChunkMetadata(int X, int Y, string HeightFile, string BiomeFile, string FlowFile, string SoilFile, string DominantBiome);
+internal sealed record ChunkMetadata(int X, int Y, string HeightFile, string BiomeFile, string FlowFile, string SoilFile, string UpliftFile, string FaultFile, string VolcanicFile, string GlacierFile, string DominantBiome);
 internal sealed record HarborMetadata(string Id, string Name, double XMeters, double YMeters, double RadiusMeters, double Shelter);
 internal sealed record RiverMetadata(string Id, string Name, double WidthMeters, List<RiverPointMetadata> Points);
 internal sealed record RiverPointMetadata(double XMeters, double YMeters);
