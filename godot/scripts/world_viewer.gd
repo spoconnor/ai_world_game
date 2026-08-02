@@ -59,7 +59,7 @@ func _build_world(manifest: Dictionary) -> void:
 	var chunk_grid: Dictionary = manifest.get("chunk_grid", {})
 	var chunks: Array = manifest.get("chunks", [])
 
-	var meters_per_unit := float(scale_info.get("meters_per_godot_unit", 10.0))
+	var meters_per_unit := float(scale_info.get("meters_per_godot_unit", 1.0))
 	var chunk_size_meters := float(scale_info.get("chunk_size_meters", 10000.0))
 	var world_width_meters := float(scale_info.get("world_width_meters", 0.0))
 	var world_height_meters := float(scale_info.get("world_height_meters", 0.0))

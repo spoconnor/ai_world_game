@@ -414,10 +414,10 @@ internal sealed class IslandWorldGenerator
             + land * 320.0
             + coastalShelf * lowlandNoise * 260.0
             + coastalShelf * detailNoise * 90.0
-            + ridge * 2_550.0
-            + secondaryRidge * 1_750.0
+            + ridge * 1_420.0
+            + secondaryRidge * 980.0
             + randomPeakHeight
-            + tectonicUplift * land * 1_250.0
+            + tectonicUplift * land * 720.0
             - riftDepression * land * 360.0
             + faultScarp * land * 220.0;
 
@@ -458,7 +458,7 @@ internal sealed class IslandWorldGenerator
         var combinedMountainMask = Math.Max(Math.Max(rangeMask, Math.Max(secondaryRangeMask, randomPeakMask)), Math.Max(tectonicUplift, volcanicActivity * 0.65));
         var mountainRainShadow = Math.Max(combinedMountainMask, tectonics.BoundaryMask * 0.5);
         var moisture = Clamp01(0.55 + Noise.Fractal(nx * 4.0 - 2.0, ny * 4.0 + 5.0, _options.Seed + 503, 4, 0.5) * 0.32 - mountainRainShadow * Math.Max(0.0, nx) * 0.35);
-        var temperature = Clamp01(0.72 - Math.Abs(ny) * 0.25 - Math.Max(0.0, height) / 4_500.0);
+        var temperature = Clamp01(0.72 - Math.Abs(ny) * 0.25 - Math.Max(0.0, height) / 2_300.0);
 
         return new BaseTerrainSample(
             SoftLimitHeight(height),
@@ -599,7 +599,7 @@ internal sealed class IslandWorldGenerator
                 x,
                 y,
                 0.045 + random.NextDouble() * 0.075,
-                420.0 + random.NextDouble() * 1_150.0,
+                240.0 + random.NextDouble() * 650.0,
                 14.0 + random.NextDouble() * 12.0,
                 random.Next(10_000, 90_000)));
         }
@@ -656,7 +656,7 @@ internal sealed class IslandWorldGenerator
                 candidate.X,
                 candidate.Y,
                 0.035 + random.NextDouble() * 0.075,
-                380.0 + candidate.Potential * 1_250.0 + random.NextDouble() * 520.0,
+                240.0 + candidate.Potential * 720.0 + random.NextDouble() * 300.0,
                 random.Next(1_000, 90_000) + index * 97))
             .ToList();
 
@@ -668,7 +668,7 @@ internal sealed class IslandWorldGenerator
                 Math.Cos(angle) * radius,
                 Math.Sin(angle) * radius * 0.8,
                 0.045 + random.NextDouble() * 0.055,
-                520.0 + random.NextDouble() * 840.0,
+                320.0 + random.NextDouble() * 480.0,
                 random.Next(1_000, 90_000)));
         }
 
@@ -723,12 +723,12 @@ internal sealed class IslandWorldGenerator
             return "coast";
         }
 
-        if (height > 2_150.0)
+        if (height > 1_180.0)
         {
             return "alpine";
         }
 
-        if (rangeMask > 0.45 && height > 900.0)
+        if (rangeMask > 0.45 && height > 520.0)
         {
             return moisture > 0.55 ? "mountain_forest" : "dry_mountains";
         }
@@ -1338,10 +1338,10 @@ internal static class TerrainConstants
     public const int DefaultErosionIterations = 96;
     public const int MaxGlobalErosionSamples = 10_000_000;
     public const double ChunkSizeMeters = 10_000.0;
-    public const double MetersPerGodotUnit = 10.0;
+    public const double MetersPerGodotUnit = 1.0;
     public const double MinHeightMeters = -250.0;
-    public const double MaxHeightMeters = 3_600.0;
-    public const double HeightSoftLimitMeters = 3_180.0;
+    public const double MaxHeightMeters = 1_600.0;
+    public const double HeightSoftLimitMeters = 1_360.0;
     public const double SoftCeilingRangeMeters = MaxHeightMeters - HeightSoftLimitMeters;
     public const int FormatVersion = 1;
 }

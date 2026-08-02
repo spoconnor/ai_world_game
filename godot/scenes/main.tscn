@@ -1,6 +1,6 @@
 [gd_scene load_steps=2 format=3 uid="uid://world_landscape_viewer_main"]
 
-[ext_resource type="Script" path="res://scripts/demo_gameplay.gd" id="1_demo"]
+[ext_resource type="Script" path="res://scripts/voxel_world_editor.gd" id="1_voxel_editor"]
 
 [node name="Main" type="Node3D"]
-script = ExtResource("1_demo")
+script = ExtResource("1_voxel_editor")
